@@ -1,38 +1,56 @@
-import { type User, type InsertUser } from "@shared/schema";
-import { randomUUID } from "crypto";
-
-// modify the interface with any CRUD methods
-// you might need
+import { db } from "./db";
+import {
+  signals, trades, settings,
+  type InsertSignal, type InsertTrade, type InsertSetting,
+  type Signal, type Trade, type Setting
+} from "@shared/schema";
+import { eq, desc } from "drizzle-orm";
 
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getSignals(): Promise<Signal[]>;
+  createSignal(signal: InsertSignal): Promise<Signal>;
+  getTrades(): Promise<Trade[]>;
+  createTrade(trade: InsertTrade): Promise<Trade>;
+  getSettings(): Promise<Setting[]>;
+  updateSetting(key: string, value: string): Promise<Setting>;
+  getSetting(key: string): Promise<Setting | undefined>;
 }
 
-export class MemStorage implements IStorage {
-  private users: Map<string, User>;
-
-  constructor() {
-    this.users = new Map();
+export class DatabaseStorage implements IStorage {
+  async getSignals(): Promise<Signal[]> {
+    return await db.select().from(signals).orderBy(desc(signals.timestamp));
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+  async createSignal(signal: InsertSignal): Promise<Signal> {
+    const [newSignal] = await db.insert(signals).values(signal).returning();
+    return newSignal;
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
+  async getTrades(): Promise<Trade[]> {
+    return await db.select().from(trades).orderBy(desc(trades.timestamp));
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+  async createTrade(trade: InsertTrade): Promise<Trade> {
+    const [newTrade] = await db.insert(trades).values(trade).returning();
+    return newTrade;
+  }
+
+  async getSettings(): Promise<Setting[]> {
+    return await db.select().from(settings);
+  }
+
+  async updateSetting(key: string, value: string): Promise<Setting> {
+    const [updated] = await db.insert(settings)
+      .values({ key, value })
+      .onConflictDoUpdate({ target: settings.key, set: { value } })
+      .returning();
+    return updated;
+  }
+
+  async getSetting(key: string): Promise<Setting | undefined> {
+    const [setting] = await db.select().from(settings).where(eq(settings.key, key));
+    return setting;
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();

@@ -37,3 +37,15 @@ author = "agent"
 task = "shell.exec"
 args = "npm run dev"
 waitForPort = 5000
+
+[agent]
+integrations = ["javascript_openai_ai_integrations:2.0.0"]
+
+[userenv]
+
+[userenv.shared]
+BINANCE_API_KEY = "30Tw2p7GQoqvDoYobEFcHArD96gMXpasx02t3sNyr6G3U09M8ccaFEvEjQeKXwBo"
+CRYPTOPANIC_API_URL = "https://cryptopanic.com/api/v1/posts/"
+CRYPTOPANIC_API_KEY = "e85ec9bd5f5cdcbc42a77fec6230c6cdc95a9e20"
+FEAR_GREED_API_URL = "https://api.alternative.me/fng/"
+BINANCE_API_SECRET = "Vjm9wmV33Du0DMfD0VFEFEp1o4RjHaGYLi8LAGL2a8GbKKI3lE7kXQ9nmxgtukrN"
