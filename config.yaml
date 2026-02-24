@@ -1,0 +1,63 @@
+exchange:
+  name: binance
+  api_key: YOUR_API_KEY_HERE
+  api_secret: YOUR_API_SECRET_HERE
+  testnet: true
+
+trading:
+  pair: BTC/USDT
+  leverage: 5
+  margin_mode: isolated
+
+strategy:
+  trend_timeframe: 15m
+  signal_timeframe: 1m
+  ema_slow: 200
+  ema_fast: 50
+  zscore_period: 20
+  zscore_threshold: 1.8
+  cvd_lookback: 10
+  atr_period: 14
+  extended_move_atr_multiplier: 1.5
+  extended_move_pivot_bars: 5
+  extended_move_lookback_bars: 20
+  spread_max_pct: 0.08
+  candle_history: 1000
+  min_composite_score_short: -2
+  min_composite_score_long: 3
+
+risk:
+  account_risk_per_trade_pct: 1.0
+  max_position_notional_usdt: 400
+  sl_atr_multiplier: 1.5
+  tp_atr_multiplier: 3.0
+  ghost_base_balance: 10000
+  max_daily_trades: 10
+  max_consecutive_losses: 3
+  cooldown_minutes: 45
+  daily_drawdown_kill_pct: 2.0
+  max_hold_minutes: 90
+
+execution:
+  order_chase_timeout_seconds: 8
+  max_repost_attempts: 3
+  paper_fill_fee_pct: 0.04
+
+external_feeds:
+  binance_futures_cache_minutes: 15
+  fear_greed_cache_minutes: 60
+  onchain_cache_minutes: 240
+  onchain_api_key: ""
+  funding_rate_threshold: 0.05
+  ls_ratio_high: 1.8
+  ls_ratio_low: 0.6
+  onchain_flow_threshold_btc: 1000
+  fear_greed_extreme_fear: 25
+  fear_greed_extreme_greed: 75
+
+governor:
+  max_calls: 10
+  window_seconds: 10
+
+binance_time:
+  sync_interval_minutes: 30
