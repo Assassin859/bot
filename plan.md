@@ -1,328 +1,542 @@
-# BTC/USDT Futures Bot — Implementation Plan
+# BTC/USDT Futures Trading Bot — Advanced Implementation Plan
 
 ## Purpose
-Build an asyncio Python 3.11+ trading system using ccxt.pro for Binance Futures, Redis as the single source of truth, and a single strategy/risk engine reused across Backtest, Paper, and Live modes.
+Build a production-grade asyncio Python 3.11+ **leverage-aware** futures trading system using ccxt.pro for Binance Futures, Redis as persistent state, and dynamic risk management that auto-scales based on user leverage, account balance, and real-time technical analysis.
 
-## High-level deliverables (strict build order)
-1. Bootstrap: requirements.txt, config.yaml, .env.example
-2. redis_state.py — only module that accesses Redis directly; Pydantic models; read_full_snapshot(); typed getters/setters
-3. exchange_client.py — ccxt.pro wrapper, token-bucket governor (10/10s), precision helpers, Binance time sync
-4. data_feed.py and indicators.py — rolling 1000-candle windows (1m, 15m), ensure_fresh(), all indicators and filter helpers
-5. external_feeds.py — async feeds with TTLs, startup force-refresh, Redis writes via redis_state.py only
-6. strategy.py — 4-layer confluence, strict gate ordering, structured JSON evaluation events
-7. risk.py — sizing, bracket planning, circuit breakers, per-candle and startup integrity checks
-8. executor.py — execute_entry_plan() supporting Ghost/Paper/Backtest/Live; SL placement guarantee
-9. logging_utils.py — structured JSON logging and Redis-backed dual event streams
-10. dashboard.py — Streamlit UI (2s refresh), automation toggle, ghost PnL, dual logs, Emergency Close
-11. backtest.py — historical replay, validation for Feb 9 and Feb 13 2026, SHA-256 promotion gate
-12. main.py — safety-first startup sequence and main strategy loop
-13. tests/test_integration.py — Redis schema, behavioral contracts, backtest promotion gate
+## Core Architecture Changes (from 1x to Leverage Support)
 
-## Project file structure
+### **User-Configurable Parameters**
+Users can now set:
+- **Trading Capital**: How much USDT to allocate to futures (e.g., $1,000 - $10,000)
+- **Leverage**: 1x to 20x (Binance Futures max)
+- **Max Risk per Trade**: % of account (e.g., 1% - 5%)
+- **Max Account Drawdown**: Before all trading stops (e.g., 5% - 20%)
+
+### **Dynamic Risk Management**
+Risk engine auto-calculates based on:
+- Account balance × Leverage × Selected Risk %
+- Stop-loss distance (ATR-based)
+- Entry price and liquidation distance
+- Margin utilization ratio
+
+### **Liquidation Protection**
+- Maintain 10%+ buffer between SL and liquidation price
+- Auto-reduce position size if leverage is extreme
+- Force-close at 15% margin utilization if SL not working
+- Warn user before opening trades near liquidation zone
+
+## High-level Build Order (14 modules + enhanced dashboard)
+
+1. **Bootstrap**: requirements.txt, config.yaml, .env.example, .gitignore
+2. **config.py** (UPDATED): User-facing parameters + leverage constants
+3. **redis_state.py** (UPDATED): New keys for leverage, capital, liquidation prices
+4. **exchange_client.py**: Unchanged (reuse existing)
+5. **data_feed.py**: Unchanged (reuse existing)
+6. **indicators.py**: Unchanged (reuse existing)
+7. **external_feeds.py**: Unchanged (reuse existing)
+8. **strategy.py**: Unchanged (reuse existing)
+9. **risk.py** (ENHANCED): Leverage-aware position sizing + liquidation checks
+10. **executor.py**: Unchanged (reuse existing)
+11. **logging_utils.py**: Unchanged (reuse existing)
+12. **leverage_calculator.py** (NEW): Core leverage math, liquidation prices, margin ratios
+13. **dashboard.py** (MAJOR UPDATE): Setup wizard, live leverage/capital config, liquidation meter
+14. **backtest.py**: Unchanged (reuse existing)
+15. **main.py**: Unchanged (reuse existing)
+16. **tests/**: Updated test suite for leverage scenarios
+
+## Project File Structure (Updated)
+
 ```
-btc_bot/
+bot/
 ├── requirements.txt
 ├── .env.example
 ├── config.yaml
-├── config.py
-├── redis_state.py
-├── exchange_client.py
-├── data_feed.py
-├── indicators.py
-├── external_feeds.py
-├── strategy.py
-├── risk.py
-├── executor.py
-├── logging_utils.py
-├── dashboard.py
-├── backtest.py
-├── main.py
+├── config.py (UPDATED)
+├── redis_state.py (UPDATED)
+├── exchange_client.py (REUSE)
+├── data_feed.py (REUSE)
+├── indicators.py (REUSE)
+├── external_feeds.py (REUSE)
+├── strategy.py (REUSE)
+├── risk.py (UPDATED)
+├── executor.py (REUSE)
+├── logging_utils.py (REUSE)
+├── leverage_calculator.py (NEW)
+├── dashboard.py (ENHANCED)
+├── backtest.py (REUSE)
+├── main.py (REUSE)
+├── plan.md (THIS FILE)
 └── tests/
-  ├── test_redis_state.py
-  ├── test_exchange_client.py
-  ├── test_data_feed.py
-  ├── test_indicators.py
-  ├── test_external_feeds.py
-  ├── test_strategy.py
-  ├── test_risk.py
-  ├── test_executor.py
-  ├── test_logging_utils.py
-  ├── test_dashboard.py
-  ├── test_backtest.py
-  ├── test_main.py
-  └── test_integration.py
+    ├── test_leverage_calculator.py (NEW)
+    ├── test_risk_leverage.py (NEW)
+    └── [other existing tests...]
 ```
 
-## config.yaml (complete, use exactly this)
-```yaml
-exchange:
-  name: binance
-  api_key: YOUR_API_KEY_HERE
-  api_secret: YOUR_API_SECRET_HERE
-  testnet: true
+## User Configuration Flow
 
-trading:
-  pair: BTC/USDT
-  leverage: 5
-  margin_mode: isolated
-
-strategy:
-  trend_timeframe: 15m
-  signal_timeframe: 1m
-  ema_slow: 200
-  ema_fast: 50
-  zscore_period: 20
-  zscore_threshold: 1.8
-  cvd_lookback: 10
-  atr_period: 14
-  extended_move_atr_multiplier: 1.5
-  extended_move_pivot_bars: 5
-  extended_move_lookback_bars: 20
-  spread_max_pct: 0.08
-  candle_history: 1000
-  min_composite_score_short: -2
-  min_composite_score_long: 3
-
-risk:
-  account_risk_per_trade_pct: 1.0
-  max_position_notional_usdt: 400
-  sl_atr_multiplier: 1.5
-  tp_atr_multiplier: 3.0
-  ghost_base_balance: 10000
-  max_daily_trades: 10
-  max_consecutive_losses: 3
-  cooldown_minutes: 45
-  daily_drawdown_kill_pct: 2.0
-  max_hold_minutes: 90
-
-execution:
-  order_chase_timeout_seconds: 8
-  max_repost_attempts: 3
-  paper_fill_fee_pct: 0.04
-
-external_feeds:
-  binance_futures_cache_minutes: 15
-  fear_greed_cache_minutes: 60
-  onchain_cache_minutes: 240
-  onchain_api_key: ""
-  funding_rate_threshold: 0.05
-  ls_ratio_high: 1.8
-  ls_ratio_low: 0.6
-  onchain_flow_threshold_btc: 1000
-  fear_greed_extreme_fear: 25
-  fear_greed_extreme_greed: 75
-
-governor:
-  max_calls: 10
-  window_seconds: 10
-
-binance_time:
-  sync_interval_minutes: 30
+### **Step 1: Initial Setup (Dashboard)**
+User lands on dashboard and sees "SETUP REQUIRED" state:
+```
+┌─────────────────────────────────────────┐
+│  ⚙️ FUTURES BOT SETUP                   │
+├─────────────────────────────────────────┤
+│                                         │
+│  Trading Capital (USDT):  [____1000__]  │
+│  Leverage (1x-20x):       [____5____]   │
+│  Max Risk per Trade (%):  [____2____]   │
+│  Max Daily Drawdown (%):  [____10___]   │
+│  Margin Mode:            [Isolated ▼]  │
+│                                         │
+│  [VALIDATE]  [SAVE]  [BACKTEST]        │
+│                                         │
+└─────────────────────────────────────────┘
 ```
 
-## .env.example
-```
-LIVE_TRADING_CONFIRMED=false
-ONCHAIN_API_KEY=
-```
+### **Step 2: Configuration Validation**
+System validates:
+- Account has enough USDT: balance >= trading_capital
+- Leverage is within Binance limits (1-20x)
+- Risk % makes sense with leverage
+- No excessive liquidation risk (SL > liquidation by 10%)
 
-## requirements.txt
-```
-ccxt[pro]>=4.0.0
-redis>=5.0.0
-pandas>=2.0.0
-numpy>=1.26.0
-pandas-ta>=0.3.14b
-streamlit>=1.35.0
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-aiohttp>=3.9.0
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-```
+### **Step 3: Risk Calculation**
+```python
+# Example calculation:
+trading_capital = $1,000
+leverage = 5x
+max_risk_per_trade = 2%
+account_balance = $10,000
 
-## Complete Redis schema — redis_state.py must implement every key listed here
+# Position sizing:
+risk_amount = $10,000 × 2% = $200
+ATR = $50
+position_size = $200 / $50 = 4 BTC equivalent
 
-### Core state
-- automation_enabled: bool — default False if missing; log WARNING: AUTOMATION_DEFAULTED_OFF
-- active_position: JSON — fields: symbol, direction, entry_price, stop_price, target_price, position_size_btc, entry_time_utc, stop_order_id, target_order_id
-- account_balance: float
-- rolling_24h_pnl: float
-- mode: str — values: backtest, paper, live
+# With leverage:
+actual_position = $1,000 × 5 = $5,000 notional
+amount = $5,000 / 50020 = 0.0999 BTC
 
-### Risk and circuit breaker keys
-- daily_trade_count: int
-- daily_trade_date: str — format YYYY-MM-DD UTC, derived from Binance server time not local OS time
-- consecutive_losses: int
-- cooldown_until: int — Unix timestamp in UTC milliseconds, 0 if none
+# Liquidation price (short example):
+liquidation = entry_price + (trading_capital / amount)
+liquidation = 50020 + (1000 / 0.0999) = 60030
 
-### External data cache keys — all JSON with fields: value and timestamp
-- funding_rate_cache
-- oi_cache
-- ls_ratio_cache
-- fear_greed_cache
-- onchain_flow_cache
-
-### Backtest promotion gate
-- backtest_validated: bool
-- backtest_validated_config_hash: str — SHA-256 hex digest
-
-### Ghost metrics
-- ghost_pnl: float
-- ghost_trade_count: int
-- ghost_win_rate: float — range 0.0 to 1.0
-
-### redis_state.py rules
-- This is the ONLY file that may call redis.get(), redis.set(), redis.delete(), or any Redis command directly
-- Every other module calls typed methods from redis_state.py only
-- No raw Redis key strings exist anywhere outside redis_state.py
-- Expose read_full_snapshot() that reads all keys before any exchange contact on startup
-
-## Key engineering constraints
-
-**Redis isolation:** redis_state.py is the only file that touches Redis directly. Every other file imports and calls typed methods from it. If any other file calls Redis directly that is a bug — flag it immediately.
-
-**Token bucket governor:** applies to every private API call in exchange_client.py without exception: order placement, cancellations, balance queries, position queries, open order status checks. Limit 10 calls per 10 seconds. When throttled, delay and log WARNING with the name of the calling function.
-
-**Precision:** every order size passes through ccxt.amount_to_precision() and every price through ccxt.price_to_precision() before submission. Never send raw Python floats to Binance.
-
-**Binance server time:** on startup and every 30 minutes via asyncio task, fetch Binance server time and compute binance_offset_ms = binance_time_ms - local_time_ms stored in memory. All timestamps (daily_trade_date, entry_time_utc, cooldown_until, max hold checks, log timestamps) use now_binance_ms = local_time_ms + binance_offset_ms. If periodic refresh fails, keep existing offset and log WARNING: BINANCE_TIME_SYNC_FAILED. If startup fetch fails, set offset to 0 and log WARNING: BINANCE_TIME_SYNC_UNAVAILABLE_USING_LOCAL — do not abort startup.
-
-**Freshness guard:** data_feed.ensure_fresh(max_age_seconds=3) is called only in the main strategy loop in main.py before every call to strategy.evaluate_signal(). strategy.py never calls ensure_fresh itself. If stale, log CRITICAL: WEBSOCKET_STALE and skip evaluation.
-
-**Strategy isolation:** `strategy.py` must not import `exchange_client.py`, `external_feeds.py`, or `redis_state.py` directly. It receives all inputs as parameters (`state_snapshot`, `candles_1m`, `candles_15m`, and `external_scores`) and is a pure function of those inputs.
-
-## Strategy gate order — strict, exit immediately on first failure
-
-evaluate_signal(state_snapshot, candles_1m, candles_15m, external_scores) -> SignalDecision
-
-Execute in this exact order, exit immediately at each failure without evaluating anything further:
-
-1. One-Position Rule: if active_position exists in state snapshot, return no-action immediately
-2. Trend gate: compute 15m EMA50 and EMA200. If price below both and EMA50 < EMA200, trend_score = -1. If price above both and EMA50 > EMA200, trend_score = +1. Otherwise return SIGNAL_REJECTED: trend_neutral immediately
-3. Reversion gate: 1m Z-Score over 20 periods. Short needs Z > +1.8 AND 3 consecutive closes each below previous. Long needs Z < -1.8 AND 3 consecutive closes each above previous. Otherwise reversion_score = 0
-4. Volume gate: 1m CVD over 10-candle lookback. Bearish divergence (price net higher last 5, CVD net lower) = -1. Bullish divergence (price net lower last 5, CVD net higher) = +1. Otherwise 0
-5. Asymmetry Hard Gate (enforced before any external layer): Short needs trend_score == -1 AND (reversion_score == -1 OR volume_score == -1). Long needs all three scores == +1. If fails, return SIGNAL_REJECTED: asymmetry_gate_failed with trend_score, reversion_score, volume_score in log — do not evaluate Layers 2-4
-6. Extended Move Filter: 1m ATR(14). Find most recent 5-candle pivot (high strictly greater than 2 before and 2 after) within last 20 bars. Short: if price fell more than 1.5x ATR below pivot high, return SIGNAL_REJECTED: extended_move with ATR, pivot price, current price. Long: symmetric using swing low. If no pivot found within 20 bars, skip filter
-7. Spread Guard: if bid-ask spread > 0.08% of mid-price, return SIGNAL_SUPPRESSED: spread_guard with spread value
-8. Load external scores from Redis caches (Layers 2, 3, 4)
-9. Compute composite score. Short approved if composite <= -2. Long approved if composite >= +3
-10. Log structured JSON for every evaluation: timestamp, side, trend_score, reversion_score, volume_score, layer2 scores, layer3 score, layer4 score, composite, decision, reason
-
-## External layer scores
-
-Layer 2 from Binance Futures REST cached every 15 minutes:
-- Funding rate > +0.05% scores -1, < -0.05% scores +1, otherwise 0
-- OI delta: price rising with OI rising scores +1 for longs, price falling with OI rising scores -1 for shorts, otherwise 0
-- Long/Short ratio > 1.8 scores -1, < 0.6 scores +1, otherwise 0
-
-Layer 3 from alternative.me cached every hour:
-- Fear and Greed 0-24 scores +1, 76-100 scores -1, 25-75 scores 0
-
-Layer 4 from CryptoQuant or Glassnode cached every 4 hours:
-- Net inflow > +1000 BTC scores -1, net outflow < -1000 BTC scores +1, otherwise 0
-- If no API key in config.yaml, always return 0 and log INFO: ONCHAIN_LAYER_DISABLED on startup
-
-## Risk management rules
-
-Position sizing: risk 1% of base balance per trade divided by ATR stop distance in dollars, result through ccxt.amount_to_precision(), hard cap at $400 notional. Base balance is account_balance from Redis for live and paper. For ghost mode, ghost_base_balance is read once from account_balance on startup and never updated.
-
-Bracket orders: SL at 1.5x ATR from entry, TP at 3x ATR from entry, submitted simultaneously with entry.
-
-Circuit breakers (all use Binance server time):
-- Daily limit: compare daily_trade_date to current Binance UTC date on every trade attempt. If date changed, reset daily_trade_count to 0 and update daily_trade_date first. Block if count >= 10 and log SIGNAL_REJECTED: daily_limit_reached
-- Cooldown: after 3 consecutive losses set cooldown_until to Binance now + 45 minutes. Reset consecutive_losses to 0 on any winning close. Log SIGNAL_REJECTED: cooldown_active when blocking
-- Kill switch: if rolling_24h_pnl < -0.02 * account_balance, cancel all orders, market-close all positions, set automation_enabled to False, halt, log CRITICAL: CIRCUIT_BREAKER_TRIGGERED
-- Max hold: if position open longer than 90 minutes by Binance time, market-close and log POSITION_CLOSED: max_hold_time
-
-Per-candle integrity: every 1m close while position is open, verify stop_order_id and target_order_id still exist on exchange. If missing, re-place immediately. If re-placement fails, market-close and log CRITICAL: STOP_ORDER_MISSING.
-
-Startup integrity: on startup, if active_position exists in Redis, query the exchange for stop_order_id and target_order_id before starting the strategy loop. If either is missing on the exchange, market-close immediately and log CRITICAL: UNPROTECTED_POSITION_ON_STARTUP.
-
-## Executor rules
-
-Ghost mode (automation_enabled == False in any operational mode):
-- Never place real or paper orders
-- Simulate fill at mid-price plus 0.04% fee using ghost-sized quantity
-- Update ghost_pnl, ghost_trade_count, ghost_win_rate in Redis after each ghost trade close
-
-Live mode SL guarantee: if entry order fills but SL placement fails, immediately market-close the position and log CRITICAL: SL_PLACEMENT_FAILED. Never allow an unprotected position under any circumstances.
-
-## Startup sequence in main.py — exact order, no changes
-
-1. Call redis_state.read_full_snapshot() — reconstruct all state before any exchange contact
-2. If active_position exists, query exchange for stop_order_id and target_order_id. If either missing, market-close and log CRITICAL: UNPROTECTED_POSITION_ON_STARTUP before proceeding
-3. Force-refresh all external feeds regardless of TTL, overwrite Redis caches
-4. Fetch 1000 historical candles for 1m and 15m, initialise DataFrames
-5. Fetch Binance server time, compute and store binance_offset_ms
-6. Start WebSocket connections and main strategy loop
-
-## Main loop responsibilities
-
-On every 1m candle close:
-- Compare automation_enabled to previous tick value (in-memory). If changed False to True, reset ghost metrics in Redis before proceeding
-- Call data_feed.ensure_fresh(3). If stale, log CRITICAL: WEBSOCKET_STALE and skip
-- Check evaluation_suspended_due_to_position flag. Log EVALUATION_SUSPENDED: active_position_open once when position opens (flag False to True). Log EVALUATION_RESUMED once when position closes (flag True to False). Never log per-candle while position held. Initialise flag to True on startup if active_position exists in Redis
-- If not suspended and fresh, call strategy.evaluate_signal() with current state snapshot
-- If approved, pass to risk.py for sizing and circuit breaker checks, then to executor.py
-
-## Backtest validation gate
-
-Run against February 9 2026 and February 13 2026. Manual history shows 54 trades on Feb 9 and 25 trades on Feb 13. Bot must produce 8 or fewer trades on each day.
-
-If any day exceeds 8 trades: log Extended Move Filter failure, do not write any validation flag, exit with sys.exit(1).
-
-If both days pass and profit factor exceeds 1.3: compute hash as hashlib.sha256((open('strategy.py','rb').read() + open('risk.py','rb').read())).hexdigest(). Write backtest_validated = True and backtest_validated_config_hash = hash to Redis. Exit successfully.
-
-On Mode B and C startup in main.py: recompute same hash from current files. If backtest_validated is not True or hashes do not match, set backtest_validated = False in Redis, log CRITICAL: STRATEGY_MODIFIED_SINCE_VALIDATION with stored hash and current hash, refuse to start.
-
-## One-Position Rule logging detail
-
-Maintain in-memory boolean evaluation_suspended_due_to_position in main loop. On startup, initialise to True if active_position exists in Redis (prevents false EVALUATION_RESUMED on first tick). Log transition events once only, never per-candle.
-
-## Ghost mode automation transition
-
-In main loop, store previous_automation_enabled as in-memory variable. On every tick, read current automation_enabled from Redis. If previous was False and current is True, reset ghost_pnl to 0.0, ghost_trade_count to 0, ghost_win_rate to 0.0 in Redis via redis_state setters before evaluating anything. Update previous_automation_enabled after the check.
-
-## Dashboard panels
-
-Auto-refresh every 2 seconds. Top row: automation toggle (large red OFF / green ON writing to Redis on click), mode, trade count vs limit, open position with unrealised PnL or None, 24h rolling PnL.
-
-Market Context Panel reads from Redis caches only (never live API calls on refresh): funding rate value and score and timestamp, OI delta direction and score, long/short ratio and score, Fear and Greed value and label and score, on-chain flow and score or disabled label.
-
-Ghost PnL panel visible when automation OFF: ghost_pnl, ghost_trade_count, ghost_win_rate. Label clearly as theoretical.
-
-Emergency Close All button in orange. Requires confirmation click. Cancels all orders, market-closes all positions, sets automation_enabled to False.
-
-Dual logs: left panel shows last 50 execution JSON events from Redis stream. Right panel shows last 50 rejection and suppression events with full score breakdowns.
-
-## Acceptance checks — every item must pass before moving to next file
-
-- redis_state.read_full_snapshot() populates every key in the schema. Missing automation_enabled defaults to False and logs WARNING: AUTOMATION_DEFAULTED_OFF
-- No file other than redis_state.py contains any Redis call. Grep for redis.get and redis.set in all other files — result must be empty
-- exchange_client token bucket logs WARNING with caller function name on every throttle
-- data_feed.ensure_fresh() is never called inside strategy.py — grep confirms this
-- Mode B and C startup recomputes SHA-256 of strategy.py + risk.py and refuses start on mismatch
-- SL failure in live executor triggers immediate market-close before any other action
-- EVALUATION_SUSPENDED and EVALUATION_RESUMED log exactly once per position lifecycle, never per-candle
-- Automation False to True transition resets all three ghost metrics in Redis in the main loop
-- All timestamps in logs and Redis use Binance server time via binance_offset_ms
-- backtest.py exits with sys.exit(1) if either validation day exceeds 8 trades
-
-- Per-candle integrity check in `risk.py` queries exchange open orders on every 1m close while a position is open, attempts re-placement if SL or TP is missing, and market-closes with `CRITICAL: STOP_ORDER_MISSING` if re-placement fails
-- On startup, if `active_position` exists in Redis, exchange is queried for both order IDs before the strategy loop starts, and `CRITICAL: UNPROTECTED_POSITION_ON_STARTUP` triggers immediate market-close if either is missing
-
-## Verification commands
-```bash
-pip install -r requirements.txt
-pytest tests/
-python backtest.py --validate
-python main.py --mode paper
-streamlit run dashboard.py
+# SL must be > liquidation + 10% buffer:
+buffer = (50020 - liquidation) × 0.10 = -1001 (need bigger buffer)
+SL = liquidation + buffer
 ```
 
-## How we will work
+## Enhanced Redis Schema
 
-I will say "build file N" and you build only that file. After generating it, you will review it against the requirements above, list every missing or incorrect item, fix them, then stop and wait for me to say "next". Do not start the next file until I confirm. Do not tell me the code looks good if any acceptance check for that file would fail.
+### **User Configuration (NEW)**
+```
+bot:config:trading_capital (float) — allocated USDT for futures
+bot:config:leverage (int) — 1 to 20x
+bot:config:max_risk_pct (float) — 1-5%
+bot:config:max_drawdown_pct (float) — account kill switch level
+bot:config:margin_mode (str) — "isolated" or "cross"
+bot:config:last_updated (ISO8601 timestamp)
+```
 
-Start now by creating the empty project structure, then wait for me to say "build file 1".
+### **Leverage State (NEW)**
+```
+bot:leverage:current (int) — active leverage multiplier
+bot:leverage:liquidation_price (float) — current position liquidation level
+bot:leverage:margin_utilization_pct (float) — 0-100% (95%+ is danger zone)
+bot:leverage:collateral_used_usdt (float) — actual margin locked
+bot:leverage:max_position_notional (float) — largest allowed position
+```
+
+### **Risk Tracking (NEW)**
+```
+bot:risk:daily_realized_pnl (float) — closed trades P&L
+bot:risk:unrealized_pnl (float) — open position P&L
+bot:risk:largest_loss_streak (int) — consecutive losses seen
+bot:risk:account_equity_curve (JSON array) — hourly snapshots
+```
+
+### **Existing Keys (Keep all)**
+All previous redis_state.py keys remain:
+- automation_enabled, active_position, account_balance, etc.
+
+## config.py (UPDATED)
+
+```python
+"""Configuration loader with leverage support"""
+
+from dataclasses import dataclass
+from typing import Literal
+
+# User-facing constants
+DEFAULT_LEVERAGE = 5
+MAX_LEVERAGE = 20
+MIN_LEVERAGE = 1
+DEFAULT_TRADING_CAPITAL = 1000  # USDT
+DEFAULT_MAX_RISK_PCT = 2.0  # per trade
+DEFAULT_MAX_DRAWDOWN_PCT = 10.0  # account kill switch
+
+# Leverage constants
+LIQUIDATION_BUFFER_PCT = 10  # Keep 10% SL margin above liquidation
+MARGIN_DANGER_ZONE_PCT = 90  # Warn above this
+MARGIN_FORCE_CLOSE_PCT = 95  # Auto-close above this
+
+# Binance limits
+BINANCE_MAX_LEVERAGE = 20
+BINANCE_MIN_LEVERAGE = 1
+BINANCE_TAKER_FEE_PCT = 0.04
+BINANCE_MAKER_FEE_PCT = 0.02
+
+@dataclass
+class LeverageConfig:
+    trading_capital: float
+    leverage: int
+    max_risk_pct: float
+    max_drawdown_pct: float
+    margin_mode: Literal["isolated", "cross"]
+
+def validate_config(config: LeverageConfig) -> bool:
+    """Validate leverage configuration"""
+    assert 0 < config.trading_capital <= 100000, "Invalid capital"
+    assert MIN_LEVERAGE <= config.leverage <= MAX_LEVERAGE, "Invalid leverage"
+    assert 0.5 <= config.max_risk_pct <= 10, "Invalid risk %"
+    assert 5 <= config.max_drawdown_pct <= 50, "Invalid drawdown %"
+    return True
+
+BINANCE_SYMBOL = "BTC/USDT"
+EXEC_CONFIG = {...}  # Keep existing config
+```
+
+## leverage_calculator.py (NEW MODULE)
+
+```python
+"""Core leverage mathematics for futures trading"""
+
+from typing import NamedTuple
+import numpy as np
+
+class LeverageContext(NamedTuple):
+    account_balance: float
+    trading_capital: float
+    leverage: int
+    entry_price: float
+    atr_stop_distance: float
+    max_risk_pct: float
+
+class LiquidationMetrics(NamedTuple):
+    liquidation_price: float
+    buffer_to_sl: float
+    margin_utilization_pct: float
+    is_liquidation_safe: bool
+    recommended_sl: float
+
+def calculate_liquidation_price(
+    side: str,
+    entry_price: float,
+    collateral: float,
+    amount: float
+) -> float:
+    """
+    Calculate liquidation price for futures position.
+    
+    Long liquidation: entry - (collateral / amount)
+    Short liquidation: entry + (collateral / amount)
+    """
+    if side == "long":
+        return entry_price - (collateral / amount)
+    else:  # short
+        return entry_price + (collateral / amount)
+
+def calculate_position_size(
+    account_balance: float,
+    trading_capital: float,
+    leverage: int,
+    atr_stop_distance: float,
+    max_risk_pct: float,
+    account_balance_usdt: float
+) -> dict:
+    """
+    Calculate position size with leverage consideration
+    
+    Formula:
+    1. Risk amount = account_balance × max_risk_pct
+    2. Position notional = (trading_capital × leverage) / entry_price
+    3. Verify: (notional / leverage) provides enough margin
+    4. Verify: SL distance allows 10% buffer from liquidation
+    """
+    risk_amount = account_balance * (max_risk_pct / 100)
+    max_position_notional = (trading_capital * leverage) / 10  # Rough max
+    
+    return {
+        "position_notional": min(risk_amount * 10, max_position_notional),
+        "max_position_notional": max_position_notional,
+        "collateral_required": trading_capital,
+        "risk_amount": risk_amount
+    }
+
+def validate_sl_position(
+    entry_price: float,
+    sl_price: float,
+    collateral: float,
+    amount: float,
+    side: str,
+    leverage: int
+) -> LiquidationMetrics:
+    """
+    Verify stop-loss is safe (10% above liquidation)
+    """
+    liq = calculate_liquidation_price(side, entry_price, collateral, amount)
+    
+    if side == "long":
+        buffer = sl_price - liq
+        is_safe = buffer > abs(liq * 0.10)  # 10% buffer
+    else:
+        buffer = liq - sl_price
+        is_safe = buffer > abs(liq * 0.10)
+    
+    margin_util = (collateral / (entry_price * amount)) * 100
+    
+    return LiquidationMetrics(
+        liquidation_price=liq,
+        buffer_to_sl=buffer,
+        margin_utilization_pct=margin_util,
+        is_liquidation_safe=is_safe,
+        recommended_sl=liq + (buffer * 0.5)  # 5% margin
+    )
+```
+
+## risk.py (UPDATED)
+
+Key changes to add leverage-aware calculations:
+
+```python
+"""Risk management with leverage support"""
+
+def compute_position_size_leverage(
+    account_balance: float,
+    trading_capital: float,
+    leverage: int,
+    atr_stop_distance_usd: float,
+    max_risk_pct: float
+) -> dict:
+    """
+    Compute position size considering leverage
+    
+    Returns:
+    {
+        "amount_btc": float,
+        "notional_usd": float,
+        "collateral_required": float,
+        "margin_utilization": float,
+        "is_safe": bool,
+        "reason": str
+    }
+    """
+    from leverage_calculator import calculate_position_size, validate_sl_position
+    
+    # Calculate base position
+    risk_amount = account_balance * (max_risk_pct / 100)
+    notional = (trading_capital * leverage) / 100  # Simplified
+    
+    # Cap at trading capital limits
+    max_notional = trading_capital * leverage
+    position_notional = min(risk_amount * leverage, max_notional * 0.8)  # 80% max
+    
+    # Check liquidation safety
+    if leverage > 1:
+        liq_check = validate_sl_position(...)
+        if not liq_check.is_liquidation_safe:
+            return {"is_safe": False, "reason": "Liquidation too close"}
+    
+    return {
+        "position_notional": position_notional,
+        "amount_btc": position_notional / current_price,
+        "collateral_required": trading_capital,
+        "margin_utilization": (trading_capital / position_notional) * 100,
+        "is_safe": True,
+        "liquidation_price": liq_check.liquidation_price
+    }
+
+def check_circuit_breakers_leverage(
+    state_snapshot,
+    config,
+    leverage: int,
+    trading_capital: float
+) -> Optional[str]:
+    """
+    Enhanced circuit breakers for leverage
+    
+    New CB5: Margin utilization >95% → force close
+    New CB6: Liquidation approaching (SL buffer <5%) → warn
+    """
+    # Existing checks...
+    
+    # CB5: Margin check
+    margin_util = state_snapshot.margin_utilization_pct
+    if margin_util > 95:
+        return "CB5: Margin utilization critical (>95%)"
+    
+    # CB6: Liquidation buffer check
+    if state_snapshot.liquidation_buffer_pct < 5:
+        return "CB6: Liquidation buffer insufficient (<5%)"
+    
+    return None  # All checks pass
+```
+
+## dashboard.py (MAJOR UPDATES)
+
+Add new sections:
+
+### **Setup Wizard (First Launch)**
+```python
+if not bot_config_exists():
+    st.title("⚙️ FUTURES BOT SETUP")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        trading_capital = st.number_input(
+            "Trading Capital (USDT)",
+            min_value=100,
+            max_value=100000,
+            value=1000,
+            step=100
+        )
+    with col2:
+        leverage = st.slider(
+            "Leverage",
+            min_value=1,
+            max_value=20,
+            value=5
+        )
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        max_risk = st.slider(
+            "Max Risk per Trade (%)",
+            min_value=0.5,
+            max_value=10.0,
+            value=2.0
+        )
+    with col2:
+        max_drawdown = st.slider(
+            "Max Daily Drawdown (%)",
+            min_value=5,
+            max_value=50,
+            value=10
+        )
+    
+    if st.button("SAVE CONFIGURATION"):
+        validate_and_save_config(...)
+        st.success("Config saved!")
+```
+
+### **Live Leverage Metrics Panel**
+```python
+st.subheader("📊 Leverage & Margin")
+
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Leverage", f"{leverage}x")
+with col2:
+    st.metric("Margin Util.", f"{margin_util:.1f}%")
+with col3:
+    st.metric("Liquidation", f"${liquidation_price:,.2f}")
+with col4:
+    st.metric("Buffer to SL", f"{buffer_pct:.1f}%")
+
+# Danger zone warning
+if margin_util > 90:
+    st.warning(f"⚠️  Margin utilization critical: {margin_util:.1f}%")
+if buffer_pct < 10:
+    st.error(f"🚨 SL too close to liquidation! Buffer: {buffer_pct:.1f}%")
+```
+
+### **Liquidation Meter**
+```python
+# Visual liquidation risk indicator
+liq_risk = (current_price - liquidation_price) / current_price * 100
+st.progress(min(liq_risk / 10, 1.0), text=f"Distance: {liq_risk:.1f}%")
+
+if liq_risk < 5:
+    st.error("EXTREME LIQUIDATION RISK - AUTO-CLOSE TRIGGERED")
+elif liq_risk < 10:
+    st.warning("DANGER ZONE - Manual intervention recommended")
+```
+
+## Test Suite
+
+New test files:
+- **test_leverage_calculator.py**: Liquidation math, margin calculations
+- **test_risk_leverage.py**: Position sizing with leverage, circuit breakers
+
+Example test:
+```python
+def test_liquidation_calculation_long():
+    """Test long position liquidation"""
+    liq = calculate_liquidation_price(
+        side="long",
+        entry_price=50020,
+        collateral=1000,
+        amount=0.01
+    )
+    expected = 50020 - (1000 / 0.01)
+    assert abs(liq - expected) < 0.01
+
+def test_sl_safety_check():
+    """Test SL is 10% above liquidation"""
+    metrics = validate_sl_position(
+        entry_price=50020,
+        sl_price=49000,
+        collateral=1000,
+        amount=0.01,
+        side="long",
+        leverage=5
+    )
+    assert metrics.is_liquidation_safe == True
+    assert metrics.margin_utilization_pct < 100
+```
+
+## Implementation Phases
+
+### **Phase 1: Core Leverage Math** (Implement leverage_calculator.py)
+- Liquidation price calculation
+- Margin utilization tracking
+- SL safety validation
+- Tests
+
+### **Phase 2: Risk Engine Updates** (Update risk.py)
+- Leverage-aware position sizing
+- Enhanced circuit breakers (CB5, CB6)
+- Integration with leverage_calculator
+
+### **Phase 3: Redis Schema** (Update redis_state.py)
+- New leverage config keys
+- New leverage state keys
+- Getters/setters for all
+
+### **Phase 4: Dashboard Setup** (Update dashboard.py)
+- Setup wizard for first-time users
+- Live leverage metrics panel
+- Liquidation meter
+- Configuration persistence
+
+### **Phase 5: Integration & Testing**
+- End-to-end tests with leverage
+- Backtest with variable leverage
+- Dashboard validation
+
+## Key Safety Principles
+
+1. **Liquidation Buffer**: SL must be 10%+ away from liquidation price
+2. **Margin Threshold**: Stop all trading at 95% margin utilization
+3. **Force Close**: Auto-close positions at 95% margin or SL <5% from liquidation
+4. **User Confirmation**: Large leverage (>5x) requires dashboard confirmation
+5. **Drawdown Kill Switch**: Existing -10% (adjustable) stops all trading
+
+## Success Criteria
+
+- ✅ User can set trading capital, leverage, and risk % via dashboard
+- ✅ System prevents liquidations via SL placement validation
+- ✅ Risk scales dynamically with leverage
+- ✅ Liquidation prices calculated correctly for shorts/longs
+- ✅ Dashboard shows real-time margin utilization and liquidation distance
+- ✅ All tests pass (including new leverage tests)
+- ✅ Backtest works with variable leverage settings

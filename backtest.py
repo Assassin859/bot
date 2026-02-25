@@ -81,7 +81,8 @@ class BacktestResults:
 class BacktestEngine:
     """Execute historical replay and compute metrics."""
     
-    def __init__(self):
+    def __init__(self, config: dict | None = None):
+        self.config = config or {}
         self.trades: list[Trade] = []
         self.active_trade: Optional[Trade] = None
         self.account_balance = 10000.0  # Starting balance
@@ -101,9 +102,7 @@ class BacktestEngine:
         # Calculate validation hash of strategy.py + risk.py
         strategy_hash = self._hash_file("strategy.py")
         risk_hash = self._hash_file("risk.py")
-        combined_hash = hashlib.sha256(
-            (strategy_hash + risk_hash).encode()
-        ).hexdigest()
+        combined_hash = hashlib.sha256((strategy_hash + risk_hash).encode()).hexdigest()
         
         if validate_hash and validate_hash != combined_hash:
             errors.append(f"Hash mismatch: expected {validate_hash}, got {combined_hash}")
@@ -120,7 +119,7 @@ class BacktestEngine:
             )
         
         # Fetch OHLCV data
-        exchange = ExchangeClient()
+        exchange = ExchangeClient(self.config)
         try:
             # Fetch 1000 candles at a time
             all_candles = []
@@ -154,8 +153,8 @@ class BacktestEngine:
                 new_15m = ohlcv_15m[max(0, len(ohlcv_15m)-67):len(ohlcv_15m)]
                 new_price = candle[4]  # Close price
                 
-                # Fetch external data
-                external_scores, _ = await fetch_all_external_data()
+                # Fetch external data (returns dict)
+                external_scores = await fetch_all_external_data()
                 
                 # Evaluate signal
                 signal = evaluate_signal(
@@ -220,7 +219,10 @@ class BacktestEngine:
                         self.active_trade = None
         
         finally:
-            exchange.close()
+            try:
+                await exchange.close()
+            except Exception:
+                pass
         
         # Calculate metrics
         winning = [t for t in self.trades if t.pnl_usd > 0]
@@ -299,7 +301,12 @@ class BacktestEngine:
 
 async def run_backtest(validate: bool = False) -> None:
     """Execute backtest with optional validation gate."""
-    engine = BacktestEngine()
+    # Load configuration (includes API keys from .env if present)
+    from config import load_config
+    cfg = load_config()
+    config_dict = cfg.dict()
+    
+    engine = BacktestEngine(config_dict)
     
     # Validation dates (Feb 9 & 13, 2026)
     feb_9_start = datetime(2026, 2, 9, 0, 0, 0)
@@ -316,7 +323,10 @@ async def run_backtest(validate: bool = False) -> None:
     except Exception:
         pass
     finally:
-        redis_state.close()
+        try:
+            await redis_state.close()
+        except Exception:
+            pass
     
     try:
         # Run Feb 9 backtest
@@ -383,7 +393,10 @@ async def run_backtest(validate: bool = False) -> None:
             except Exception as e:
                 print(f"⚠️  Could not store hash: {e}")
             finally:
-                redis.close()
+                try:
+                    await redis.close()
+                except Exception:
+                    pass
         else:
             print("✓ Backtest complete (non-validated run)")
     

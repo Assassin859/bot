@@ -109,7 +109,7 @@ async def step_2_external_feeds_refresh(bot_state: BotState) -> bool:
         return False
 
 
-async def step_3_fetch_historical_candles(bot_state: BotState) -> bool:
+async def step_3_fetch_historical_candles(bot_state: BotState, config: dict) -> bool:
     """Step 3: Fetch 1000 historical candles (1m and 15m).
     
     Initializes DataFeed rolling windows.
@@ -117,7 +117,7 @@ async def step_3_fetch_historical_candles(bot_state: BotState) -> bool:
     """
     log_event("INFO", {"msg": "Step 3: Fetching 1000 historical candles"})
     
-    bot_state.exchange = ExchangeClient()
+    bot_state.exchange = ExchangeClient(config)
     bot_state.data_feed = DataFeed(BINANCE_SYMBOL)
     
     try:
@@ -344,6 +344,11 @@ async def main(mode: str = "paper") -> None:
     bot_state = BotState()
     
     try:
+        # Load configuration (includes API keys from .env if present)
+        from config import load_config
+        cfg = load_config()
+        config_dict = cfg.dict()
+        
         # Step 1: Redis snapshot
         if not await step_1_redis_snapshot(bot_state, mode):
             log_event("ERROR", {"msg": "Step 1 failed, aborting"})
@@ -354,9 +359,16 @@ async def main(mode: str = "paper") -> None:
             log_event("WARNING", {"msg": "Step 2 warning, continuing"})
         
         # Step 3: Historical candles
-        if not await step_3_fetch_historical_candles(bot_state):
+        if not await step_3_fetch_historical_candles(bot_state, config_dict):
             log_event("ERROR", {"msg": "Step 3 failed, aborting"})
             sys.exit(1)
+        else:
+            # Sync account balance and leverage from exchange into Redis
+            try:
+                if bot_state.exchange and bot_state.redis:
+                    await bot_state.exchange.sync_account_to_redis(bot_state.redis, BINANCE_SYMBOL)
+            except Exception as e:
+                log_event("WARNING", {"msg": "Account sync warning", "error": str(e)})
         
         # Step 4: Binance sync
         if not await step_4_binance_sync(bot_state):

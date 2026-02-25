@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Dict, Any, Optional
+import os
 import aiohttp
 from logging_utils import log_event
 
@@ -123,8 +124,15 @@ async def fetch_onchain_flow(api_key: Optional[str] = None) -> Dict[str, Any]:
     Returns on failure or missing API key:
         {"value": 0.0, "timestamp": 0}
     """
+    # Allow environment-provided API key when caller doesn't pass one
     if not api_key:
-        log_event("INFO", {"msg": "EXTERNAL_FEED_FALLBACK", "feed": "onchain_flow", "reason": "no_api_key"})
+        api_key = os.getenv("CRYPTOQUANT_API_KEY")
+
+    # Avoid logging the missing-key fallback repeatedly
+    if not api_key:
+        if not getattr(fetch_onchain_flow, "_no_api_key_logged", False):
+            log_event("INFO", {"msg": "EXTERNAL_FEED_FALLBACK", "feed": "onchain_flow", "reason": "no_api_key"})
+            setattr(fetch_onchain_flow, "_no_api_key_logged", True)
         return {"value": 0.0, "timestamp": 0}
     
     try:

@@ -2,9 +2,10 @@
 
 Implements 1% risk sizing per trade, 4 circuit breakers (daily limit, consecutive
 losses, 24h drawdown kill switch, max hold time), plus per-candle integrity checks.
+Also includes leverage-aware position sizing with liquidation protection (NEW).
 """
 from __future__ import annotations
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, NamedTuple
 import time
 from logging_utils import log_event
 
@@ -274,3 +275,251 @@ def check_candle_integrity(
             return f"CANDLE_INTEGRITY: TP ({target_price}) above recent lows ({min_low})"
     
     return None
+
+
+# ============================================================
+# LEVERAGE-AWARE ENHANCEMENTS (NEW)
+# ============================================================
+
+class PositionSizeWithLeverageResult(NamedTuple):
+    """Position sizing result with leverage consideration."""
+    position_notional: float
+    amount_btc: float
+    collateral_required: float
+    margin_utilization_pct: float
+    liquidation_price: float
+    recommended_sl: float
+    is_safe: bool
+    reason: str
+
+
+def compute_position_size_leverage(
+    account_balance: float,
+    trading_capital: float,
+    leverage: int,
+    entry_price: float,
+    atr_stop_distance_usd: float,
+    max_risk_pct: float,
+    side: str = "long"
+) -> PositionSizeWithLeverageResult:
+    """Compute position size considering leverage and liquidation safety.
+    
+    Formula:
+    1. Risk amount = account_balance × max_risk_pct
+    2. Max position notional = trading_capital × leverage × 0.8 (80% safety cap)
+    3. Position size = min(risk × leverage, max_notional)
+    4. Validate SL has 10% buffer from liquidation
+    
+    Args:
+        account_balance: Total account balance in USDT
+        trading_capital: Allocated to futures in USDT
+        leverage: Leverage multiplier (1-20)
+        entry_price: Entry price in USDT
+        atr_stop_distance_usd: Stop loss distance from entry in USDT
+        max_risk_pct: Max risk per trade as % of account
+        side: "long" or "short"
+    
+    Returns:
+        PositionSizeWithLeverageResult with all sizing parameters
+    """
+    from leverage_calculator import (
+        calculate_liquidation_price,
+        calculate_margin_utilization,
+        validate_sl_position,
+    )
+    
+    # Input validation
+    if leverage < 1 or leverage > 20:
+        return PositionSizeWithLeverageResult(
+            position_notional=0,
+            amount_btc=0,
+            collateral_required=trading_capital,
+            margin_utilization_pct=0,
+            liquidation_price=0,
+            recommended_sl=0,
+            is_safe=False,
+            reason=f"Invalid leverage: {leverage}"
+        )
+    
+    if atr_stop_distance_usd <= 0:
+        return PositionSizeWithLeverageResult(
+            position_notional=0,
+            amount_btc=0,
+            collateral_required=trading_capital,
+            margin_utilization_pct=0,
+            liquidation_price=0,
+            recommended_sl=0,
+            is_safe=False,
+            reason="ATR stop distance must be positive"
+        )
+    
+    # Calculate risk amount
+    risk_amount = account_balance * (max_risk_pct / 100)
+    
+    # Calculate position size with leverage
+    max_position_notional = trading_capital * leverage * 0.8  # 80% cap
+    position_notional = min(risk_amount * leverage, max_position_notional)
+    
+    # Ensure minimum position size for execution
+    if position_notional < 10:  # Less than $10 is too small
+        position_notional = 0
+        amount_btc = 0
+    else:
+        amount_btc = position_notional / entry_price
+    
+    # Calculate margin utilization
+    margin_util = (position_notional / trading_capital * 100) if trading_capital > 0 else 0
+    
+    # Validate liquidation safety
+    if amount_btc > 0:
+        # SL placement
+        sl_price = entry_price - atr_stop_distance_usd if side == "long" else entry_price + atr_stop_distance_usd
+        
+        # Check SL safety with leverage
+        metrics = validate_sl_position(
+            entry_price=entry_price,
+            sl_price=sl_price,
+            collateral=trading_capital,
+            amount=amount_btc,
+            side=side,
+            leverage=leverage
+        )
+        
+        # Position is safe if:
+        # 1. SL buffer >= 10% from liquidation AND
+        # 2. Margin utilization < 95%
+        is_safe = metrics.is_liquidation_safe and margin_util < 95
+        
+        reason = f"✓ Safe" if is_safe else f"⚠ SL buffer: {metrics.buffer_pct:.1f}%"
+        
+        return PositionSizeWithLeverageResult(
+            position_notional=position_notional,
+            amount_btc=amount_btc,
+            collateral_required=trading_capital,
+            margin_utilization_pct=margin_util,
+            liquidation_price=metrics.liquidation_price,
+            recommended_sl=metrics.recommended_sl,
+            is_safe=is_safe,
+            reason=reason
+        )
+    else:
+        return PositionSizeWithLeverageResult(
+            position_notional=0,
+            amount_btc=0,
+            collateral_required=trading_capital,
+            margin_utilization_pct=0,
+            liquidation_price=0,
+            recommended_sl=0,
+            is_safe=True,
+            reason="No position"
+        )
+
+
+def check_circuit_breakers_leverage(
+    state_snapshot: Dict[str, Any],
+    config: Dict[str, Any],
+    binance_offset_ms: int = 0
+) -> Optional[str]:
+    """Enhanced circuit breakers for leverage trading.
+    
+    Existing breakers (CB1-CB4):
+    1. Daily Trade Limit
+    2. Consecutive Losses + Cooldown
+    3. 24h Drawdown Kill Switch
+    4. Max Hold Duration
+    
+    New breakers with leverage (CB5-CB6):
+    5. Margin Utilization > 95% → Force close
+    6. Liquidation buffer < 5% → Refuse trade
+    
+    Args:
+        state_snapshot: RedisSnapshot with leverage state
+        config: Config with risk section
+        binance_offset_ms: Binance time offset
+    
+    Returns:
+        Rejection reason string, or None if all pass
+    """
+    # First check existing circuit breakers (CB1-CB4)
+    existing_cb = check_circuit_breakers(state_snapshot, config, binance_offset_ms)
+    if existing_cb:
+        return existing_cb
+    
+    # NEW: CB5 - Margin utilization check
+    margin_util = state_snapshot.get("leverage_margin_utilization_pct", 0.0)
+    if margin_util > 95:
+        return f"CB5: Margin utilization critical ({margin_util:.1f}% > 95%) - FORCE CLOSE"
+    
+    if margin_util > 90:
+        # Warning level but no rejection
+        log_event("WARNING", {"msg": "CB5_MARGIN_WARNING", "level_pct": margin_util})
+    
+    # NEW: CB6 - Liquidation buffer check
+    liquidation_price = state_snapshot.get("leverage_liquidation_price", 0.0)
+    active_position = state_snapshot.get("active_position")
+    
+    if active_position and liquidation_price:
+        # Get current price (approximated from entry price if available)
+        # In real usage, this would be looked up from market data
+        entry_price = active_position.get("entry_price", 0.0) if isinstance(active_position, dict) else 0.0
+        
+        if entry_price > 0 and liquidation_price > 0:
+            direction = active_position.get("direction", "long") if isinstance(active_position, dict) else "long"
+            
+            if direction == "long":
+                buffer_pct = (entry_price - liquidation_price) / liquidation_price * 100
+            else:
+                buffer_pct = (liquidation_price - entry_price) / liquidation_price * 100
+            
+            # Critical: buffer < 5%
+            if buffer_pct < 5 and buffer_pct > 0:
+                return f"CB6: Liquidation buffer critically low ({buffer_pct:.1f}% < 5%) - FORCE CLOSE"
+            
+            # Warning: buffer < 10%
+            if buffer_pct < 10 and buffer_pct > 0:
+                log_event("WARNING", {"msg": "CB6_LIQUIDATION_WARNING", "buffer_pct": buffer_pct})
+    
+    # All breakers pass
+    return None
+
+
+def validate_sl_buffer(
+    entry_price: float,
+    sl_price: float,
+    liquidation_price: float,
+    side: str,
+    buffer_pct_min: float = 10.0
+) -> tuple[bool, str]:
+    """Validate SL has minimum buffer from liquidation.
+    
+    Args:
+        entry_price: Entry price in USDT
+        sl_price: Stop loss price in USDT
+        liquidation_price: Liquidation price in USDT
+        side: "long" or "short"
+        buffer_pct_min: Minimum buffer percentage (default 10%)
+    
+    Returns:
+        (is_valid, message) tuple
+    """
+    if liquidation_price == 0:
+        return True, "Liquidation price not set, skipping validation"
+    
+    if side == "long":
+        # For long: SL should be above liquidation
+        buffer_price = sl_price - liquidation_price
+        buffer_pct = (buffer_price / abs(liquidation_price)) * 100
+        
+        min_buffer_price = abs(liquidation_price) * (buffer_pct_min / 100)
+        is_valid = buffer_price >= min_buffer_price
+    else:
+        # For short: SL should be below liquidation  
+        buffer_price = liquidation_price - sl_price
+        buffer_pct = (buffer_price / abs(liquidation_price)) * 100
+        
+        min_buffer_price = abs(liquidation_price) * (buffer_pct_min / 100)
+        is_valid = buffer_price >= min_buffer_price
+    
+    message = f"SL buffer: {buffer_pct:.1f}% (min: {buffer_pct_min}%)"
+    
+    return is_valid, message

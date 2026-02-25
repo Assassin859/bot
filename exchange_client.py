@@ -124,12 +124,18 @@ class ExchangeClient:
         symbol: str,
         timeframe: str = "1m",
         limit: int = 1000,
-        since: Optional[int] = None
+        since: Optional[int] = None,
+        start_date: Optional[int] = None
     ) -> List[List[Any]]:
         """Fetch OHLCV candles from Binance Futures (public call, not governed)."""
         await self.init_exchange()
         try:
-            return await self._exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            # Support either `since` or legacy `start_date` keyword
+            if start_date is not None:
+                since_val = start_date
+            else:
+                since_val = since
+            return await self._exchange.fetch_ohlcv(symbol, timeframe, since=since_val, limit=limit)
         except Exception as e:
             log_event("ERROR", {"msg": "fetch_ohlcv failed", "symbol": symbol, "error": str(e)})
             raise
@@ -211,3 +217,82 @@ class ExchangeClient:
         except Exception as e:
             log_event("ERROR", {"msg": "fetch_balance failed", "error": str(e)})
             raise
+
+    async def sync_account_to_redis(self, redis_state, symbol: str = "BTC/USDT") -> None:
+        """Fetch key account info from the exchange and write to Redis.
+
+        - Writes `account_balance` (USDT free balance) to Redis
+        - Writes `leverage:current_leverage` if a position or default leverage is detected
+        - Writes `leverage:max_position_notional` based on trading balance × leverage
+        """
+        await self.init_exchange()
+        try:
+            # Fetch balance
+            bal = await self.fetch_balance()
+            usdt = 0.0
+            # ccxt balance structure varies; prefer 'USDT' key then 'total'/'free'
+            if isinstance(bal, dict):
+                if "USDT" in bal:
+                    entry = bal.get("USDT") or {}
+                    usdt = float(entry.get("free") or entry.get("total") or 0.0)
+                else:
+                    # Try common fallback keys
+                    for k in ("USDT", "USD"):
+                        if k in bal:
+                            entry = bal.get(k) or {}
+                            usdt = float(entry.get("free") or entry.get("total") or 0.0)
+
+            # Write account balance to Redis
+            try:
+                await redis_state.set_account_balance(usdt)
+            except Exception:
+                log_event("WARNING", {"msg": "Failed writing account balance to Redis"})
+
+            # Try to detect current leverage from positions
+            leverage_detected = None
+            try:
+                positions = await self.fetch_positions(symbols=[symbol])
+                if isinstance(positions, list):
+                    for p in positions:
+                        # ccxt position info may include 'leverage' or 'leverage' within 'info'
+                        lev = None
+                        if isinstance(p, dict):
+                            lev = p.get("leverage") or (p.get("info") or {}).get("leverage")
+                        if lev:
+                            leverage_detected = int(lev)
+                            break
+            except Exception:
+                # Non-fatal
+                leverage_detected = None
+
+            # If none detected, try market max leverage
+            if leverage_detected is None:
+                try:
+                    # load markets and inspect market info
+                    await self._exchange.load_markets()
+                    m = self._exchange.markets.get(symbol)
+                    if m and isinstance(m, dict):
+                        info = m.get("info") or {}
+                        # Binance futures may expose 'maxLeverage' in market info
+                        ml = info.get("maxLeverage") or info.get("max_leverage") or info.get("maxLeverageRate")
+                        if ml:
+                            leverage_detected = int(ml)
+                except Exception:
+                    leverage_detected = None
+
+            # Bound leverage to sensible defaults
+            if leverage_detected is None:
+                from config import DEFAULT_LEVERAGE
+                leverage_detected = DEFAULT_LEVERAGE
+
+            # Persist leverage and derived max notional
+            try:
+                await redis_state.set_leverage_current(int(leverage_detected))
+                # conservative max position notional = usdt * leverage_detected
+                await redis_state.set_leverage_max_position_notional(float(usdt * float(leverage_detected)))
+            except Exception:
+                log_event("WARNING", {"msg": "Failed writing leverage state to Redis"})
+
+        except Exception as e:
+            log_event("WARNING", {"msg": "sync_account_to_redis failed", "error": str(e)})
+            return

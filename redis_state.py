@@ -34,6 +34,33 @@ K_GHOST_PNL = "ghost_pnl"
 K_GHOST_TRADE_COUNT = "ghost_trade_count"
 K_GHOST_WIN_RATE = "ghost_win_rate"
 
+# ============================================================
+# LEVERAGE CONFIGURATION KEYS (NEW)
+# ============================================================
+K_LEVERAGE_TRADING_CAPITAL = "leverage:trading_capital"
+K_LEVERAGE_MULTIPLIER = "leverage:leverage"  # 1-20x
+K_LEVERAGE_MAX_RISK_PCT = "leverage:max_risk_pct"
+K_LEVERAGE_MAX_DRAWDOWN_PCT = "leverage:max_drawdown_pct"
+K_LEVERAGE_MARGIN_MODE = "leverage:margin_mode"  # "isolated" or "cross"
+K_LEVERAGE_CONFIG_UPDATED = "leverage:config_updated"  # ISO8601 timestamp
+
+# ============================================================
+# LEVERAGE STATE KEYS (NEW)
+# ============================================================
+K_LEVERAGE_CURRENT = "leverage:current_leverage"
+K_LEVERAGE_LIQUIDATION_PRICE = "leverage:liquidation_price"
+K_LEVERAGE_MARGIN_UTILIZATION = "leverage:margin_utilization_pct"
+K_LEVERAGE_COLLATERAL_USED = "leverage:collateral_used_usdt"
+K_LEVERAGE_MAX_POSITION_NOTIONAL = "leverage:max_position_notional"
+
+# ============================================================
+# RISK TRACKING KEYS (NEW)
+# ============================================================
+K_RISK_DAILY_REALIZED_PNL = "risk:daily_realized_pnl"
+K_RISK_UNREALIZED_PNL = "risk:unrealized_pnl"
+K_RISK_LARGEST_LOSS_STREAK = "risk:largest_loss_streak"
+K_RISK_EQUITY_CURVE = "risk:equity_curve"  # JSON array of hourly snapshots
+
 
 class ActivePosition(BaseModel):
     symbol: str
@@ -72,6 +99,24 @@ class RedisSnapshot(BaseModel):
     ghost_pnl: float = 0.0
     ghost_trade_count: int = 0
     ghost_win_rate: float = 0.0
+    # Leverage configuration (NEW)
+    leverage_trading_capital: float = 1000.0
+    leverage_multiplier: int = 5
+    leverage_max_risk_pct: float = 2.0
+    leverage_max_drawdown_pct: float = 10.0
+    leverage_margin_mode: str = "isolated"
+    leverage_config_updated: Optional[str] = None
+    # Leverage state (NEW)
+    leverage_current: int = 1
+    leverage_liquidation_price: float = 0.0
+    leverage_margin_utilization_pct: float = 0.0
+    leverage_collateral_used_usdt: float = 0.0
+    leverage_max_position_notional: float = 0.0
+    # Risk tracking (NEW)
+    risk_daily_realized_pnl: float = 0.0
+    risk_unrealized_pnl: float = 0.0
+    risk_largest_loss_streak: int = 0
+    risk_equity_curve: Optional[list[dict[str, Any]]] = None
 
 
 class RedisState:
@@ -136,6 +181,24 @@ class RedisState:
             K_GHOST_PNL,
             K_GHOST_TRADE_COUNT,
             K_GHOST_WIN_RATE,
+            # Leverage config
+            K_LEVERAGE_TRADING_CAPITAL,
+            K_LEVERAGE_MULTIPLIER,
+            K_LEVERAGE_MAX_RISK_PCT,
+            K_LEVERAGE_MAX_DRAWDOWN_PCT,
+            K_LEVERAGE_MARGIN_MODE,
+            K_LEVERAGE_CONFIG_UPDATED,
+            # Leverage state
+            K_LEVERAGE_CURRENT,
+            K_LEVERAGE_LIQUIDATION_PRICE,
+            K_LEVERAGE_MARGIN_UTILIZATION,
+            K_LEVERAGE_COLLATERAL_USED,
+            K_LEVERAGE_MAX_POSITION_NOTIONAL,
+            # Risk tracking
+            K_RISK_DAILY_REALIZED_PNL,
+            K_RISK_UNREALIZED_PNL,
+            K_RISK_LARGEST_LOSS_STREAK,
+            K_RISK_EQUITY_CURVE,
         ]
 
         pipe = self._client.pipeline()
@@ -188,6 +251,12 @@ class RedisState:
         ls_cache = self._loads_json(mapping.get(K_LS_RATIO_CACHE))
         fg_cache = self._loads_json(mapping.get(K_FEAR_GREED_CACHE))
         onchain_cache = self._loads_json(mapping.get(K_ONCHAIN_FLOW_CACHE))
+        
+        # Parse equity curve from JSON
+        equity_curve = None
+        equity_raw = self._loads_json(mapping.get(K_RISK_EQUITY_CURVE))
+        if isinstance(equity_raw, list):
+            equity_curve = equity_raw
 
         snapshot = RedisSnapshot(
             automation_enabled=automation_enabled,
@@ -209,9 +278,31 @@ class RedisState:
             ghost_pnl=_float_of(K_GHOST_PNL, 0.0),
             ghost_trade_count=_int_of(K_GHOST_TRADE_COUNT, 0),
             ghost_win_rate=_float_of(K_GHOST_WIN_RATE, 0.0),
+            # Leverage configuration
+            leverage_trading_capital=_float_of(K_LEVERAGE_TRADING_CAPITAL, 1000.0),
+            leverage_multiplier=_int_of(K_LEVERAGE_MULTIPLIER, 5),
+            leverage_max_risk_pct=_float_of(K_LEVERAGE_MAX_RISK_PCT, 2.0),
+            leverage_max_drawdown_pct=_float_of(K_LEVERAGE_MAX_DRAWDOWN_PCT, 10.0),
+            leverage_margin_mode=_str_of(K_LEVERAGE_MARGIN_MODE, "isolated"),
+            leverage_config_updated=_str_of(K_LEVERAGE_CONFIG_UPDATED, None),
+            # Leverage state
+            leverage_current=_int_of(K_LEVERAGE_CURRENT, 1),
+            leverage_liquidation_price=_float_of(K_LEVERAGE_LIQUIDATION_PRICE, 0.0),
+            leverage_margin_utilization_pct=_float_of(K_LEVERAGE_MARGIN_UTILIZATION, 0.0),
+            leverage_collateral_used_usdt=_float_of(K_LEVERAGE_COLLATERAL_USED, 0.0),
+            leverage_max_position_notional=_float_of(K_LEVERAGE_MAX_POSITION_NOTIONAL, 0.0),
+            # Risk tracking
+            risk_daily_realized_pnl=_float_of(K_RISK_DAILY_REALIZED_PNL, 0.0),
+            risk_unrealized_pnl=_float_of(K_RISK_UNREALIZED_PNL, 0.0),
+            risk_largest_loss_streak=_int_of(K_RISK_LARGEST_LOSS_STREAK, 0),
+            risk_equity_curve=equity_curve,
         )
 
         return snapshot
+
+    async def get_snapshot(self) -> RedisSnapshot:
+        """Compatibility wrapper for older code: returns the current RedisSnapshot."""
+        return await self.read_full_snapshot()
 
     # --- typed getters/setters ---------------------------------
     async def get_automation_enabled(self) -> bool:
@@ -245,6 +336,210 @@ class RedisState:
 
     async def set_account_balance(self, amount: float) -> None:
         await self._client.set(K_ACCOUNT_BALANCE, str(amount))
+
+    # --- Leverage configuration getters/setters (NEW) ----------
+    async def get_leverage_config(self) -> dict:
+        """Get all leverage configuration as dict."""
+        return {
+            "trading_capital": await self.get_leverage_trading_capital(),
+            "leverage": await self.get_leverage_multiplier(),
+            "max_risk_pct": await self.get_leverage_max_risk_pct(),
+            "max_drawdown_pct": await self.get_leverage_max_drawdown_pct(),
+            "margin_mode": await self.get_leverage_margin_mode(),
+            "config_updated": await self.get_leverage_config_updated(),
+        }
+
+    async def set_leverage_config(self, config: dict) -> None:
+        """Set multiple leverage configuration keys atomically.
+
+        Expects keys: trading_capital, leverage, max_risk_pct, max_drawdown_pct, margin_mode
+        """
+        # Prepare values with sane defaults/validation
+        trading_capital = float(config.get("trading_capital", 1000.0))
+        leverage = int(config.get("leverage", 5))
+        max_risk_pct = float(config.get("max_risk_pct", 2.0))
+        max_drawdown_pct = float(config.get("max_drawdown_pct", 10.0))
+        margin_mode = config.get("margin_mode", "isolated")
+
+        # Timestamp
+        from datetime import datetime
+        ts = datetime.utcnow().isoformat() + "Z"
+
+        pipe = self._client.pipeline()
+        pipe.set(K_LEVERAGE_TRADING_CAPITAL, str(trading_capital))
+        pipe.set(K_LEVERAGE_MULTIPLIER, str(leverage))
+        pipe.set(K_LEVERAGE_MAX_RISK_PCT, str(max_risk_pct))
+        pipe.set(K_LEVERAGE_MAX_DRAWDOWN_PCT, str(max_drawdown_pct))
+        pipe.set(K_LEVERAGE_MARGIN_MODE, margin_mode)
+        pipe.set(K_LEVERAGE_CONFIG_UPDATED, ts)
+        await pipe.execute()
+
+    async def get_leverage_trading_capital(self) -> float:
+        v = await self._client.get(K_LEVERAGE_TRADING_CAPITAL)
+        try:
+            return float(v) if v is not None else 1000.0
+        except Exception:
+            return 1000.0
+
+    async def set_leverage_trading_capital(self, capital: float) -> None:
+        await self._client.set(K_LEVERAGE_TRADING_CAPITAL, str(capital))
+
+    async def get_leverage_multiplier(self) -> int:
+        v = await self._client.get(K_LEVERAGE_MULTIPLIER)
+        try:
+            return int(v) if v is not None else 5
+        except Exception:
+            return 5
+
+    async def set_leverage_multiplier(self, leverage: int) -> None:
+        await self._client.set(K_LEVERAGE_MULTIPLIER, str(leverage))
+
+    async def get_leverage_max_risk_pct(self) -> float:
+        v = await self._client.get(K_LEVERAGE_MAX_RISK_PCT)
+        try:
+            return float(v) if v is not None else 2.0
+        except Exception:
+            return 2.0
+
+    async def set_leverage_max_risk_pct(self, risk_pct: float) -> None:
+        await self._client.set(K_LEVERAGE_MAX_RISK_PCT, str(risk_pct))
+
+    async def get_leverage_max_drawdown_pct(self) -> float:
+        v = await self._client.get(K_LEVERAGE_MAX_DRAWDOWN_PCT)
+        try:
+            return float(v) if v is not None else 10.0
+        except Exception:
+            return 10.0
+
+    async def set_leverage_max_drawdown_pct(self, drawdown_pct: float) -> None:
+        await self._client.set(K_LEVERAGE_MAX_DRAWDOWN_PCT, str(drawdown_pct))
+
+    async def get_leverage_margin_mode(self) -> str:
+        v = await self._client.get(K_LEVERAGE_MARGIN_MODE)
+        return v if v in ("isolated", "cross") else "isolated"
+
+    async def set_leverage_margin_mode(self, mode: str) -> None:
+        if mode not in ("isolated", "cross"):
+            raise ValueError(f"Invalid margin mode: {mode}")
+        await self._client.set(K_LEVERAGE_MARGIN_MODE, mode)
+
+    async def get_leverage_config_updated(self) -> str:
+        v = await self._client.get(K_LEVERAGE_CONFIG_UPDATED)
+        return v or ""
+
+    async def set_leverage_config_updated(self, timestamp: str) -> None:
+        await self._client.set(K_LEVERAGE_CONFIG_UPDATED, timestamp)
+
+    # --- Leverage state getters/setters (NEW) -----------------
+    async def get_leverage_state(self) -> dict:
+        """Get all leverage state as dict."""
+        return {
+            "current_leverage": await self.get_leverage_current(),
+            "liquidation_price": await self.get_leverage_liquidation_price(),
+            "margin_utilization_pct": await self.get_leverage_margin_utilization(),
+            "collateral_used_usdt": await self.get_leverage_collateral_used(),
+            "max_position_notional": await self.get_leverage_max_position_notional(),
+        }
+
+    async def get_leverage_current(self) -> int:
+        v = await self._client.get(K_LEVERAGE_CURRENT)
+        try:
+            return int(v) if v is not None else 1
+        except Exception:
+            return 1
+
+    async def set_leverage_current(self, leverage: int) -> None:
+        await self._client.set(K_LEVERAGE_CURRENT, str(leverage))
+
+    async def get_leverage_liquidation_price(self) -> float:
+        v = await self._client.get(K_LEVERAGE_LIQUIDATION_PRICE)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_leverage_liquidation_price(self, price: float) -> None:
+        await self._client.set(K_LEVERAGE_LIQUIDATION_PRICE, str(price))
+
+    async def get_leverage_margin_utilization(self) -> float:
+        v = await self._client.get(K_LEVERAGE_MARGIN_UTILIZATION)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_leverage_margin_utilization(self, pct: float) -> None:
+        await self._client.set(K_LEVERAGE_MARGIN_UTILIZATION, str(pct))
+
+    async def get_leverage_collateral_used(self) -> float:
+        v = await self._client.get(K_LEVERAGE_COLLATERAL_USED)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_leverage_collateral_used(self, usdt: float) -> None:
+        await self._client.set(K_LEVERAGE_COLLATERAL_USED, str(usdt))
+
+    async def get_leverage_max_position_notional(self) -> float:
+        v = await self._client.get(K_LEVERAGE_MAX_POSITION_NOTIONAL)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_leverage_max_position_notional(self, notional: float) -> None:
+        await self._client.set(K_LEVERAGE_MAX_POSITION_NOTIONAL, str(notional))
+
+    # --- Risk tracking getters/setters (NEW) ------------------
+    async def get_risk_tracking(self) -> dict:
+        """Get all risk tracking metrics as dict."""
+        return {
+            "daily_realized_pnl": await self.get_risk_daily_realized_pnl(),
+            "unrealized_pnl": await self.get_risk_unrealized_pnl(),
+            "largest_loss_streak": await self.get_risk_largest_loss_streak(),
+            "equity_curve": await self.get_risk_equity_curve(),
+        }
+
+    async def get_risk_daily_realized_pnl(self) -> float:
+        v = await self._client.get(K_RISK_DAILY_REALIZED_PNL)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_risk_daily_realized_pnl(self, pnl: float) -> None:
+        await self._client.set(K_RISK_DAILY_REALIZED_PNL, str(pnl))
+
+    async def get_risk_unrealized_pnl(self) -> float:
+        v = await self._client.get(K_RISK_UNREALIZED_PNL)
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    async def set_risk_unrealized_pnl(self, pnl: float) -> None:
+        await self._client.set(K_RISK_UNREALIZED_PNL, str(pnl))
+
+    async def get_risk_largest_loss_streak(self) -> int:
+        v = await self._client.get(K_RISK_LARGEST_LOSS_STREAK)
+        try:
+            return int(v) if v is not None else 0
+        except Exception:
+            return 0
+
+    async def set_risk_largest_loss_streak(self, streak: int) -> None:
+        await self._client.set(K_RISK_LARGEST_LOSS_STREAK, str(streak))
+
+    async def get_risk_equity_curve(self) -> list[dict]:
+        v = await self._client.get(K_RISK_EQUITY_CURVE)
+        curve = self._loads_json(v)
+        if isinstance(curve, list):
+            return curve
+        return []
+
+    async def set_risk_equity_curve(self, curve: list[dict]) -> None:
+        await self._client.set(K_RISK_EQUITY_CURVE, self._dumps_json(curve))
 
     # Additional setters/getters for caches and metrics
     async def set_cache(self, key: str, value: Dict[str, Any]) -> None:
