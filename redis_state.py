@@ -61,6 +61,14 @@ K_RISK_UNREALIZED_PNL = "risk:unrealized_pnl"
 K_RISK_LARGEST_LOSS_STREAK = "risk:largest_loss_streak"
 K_RISK_EQUITY_CURVE = "risk:equity_curve"  # JSON array of hourly snapshots
 
+# ============================================================
+# BOT CONTROL KEYS (NEW)
+# ============================================================
+K_BOT_MODE = "bot:mode"  # Current mode (backtest|paper|ghost|live)
+K_BOT_PROCESS_ID = "bot:process_id"  # Running bot PID
+K_BOT_STATUS = "bot:status"  # running|stopped|error
+K_BOT_STARTED_AT = "bot:started_at"  # ISO8601 timestamp
+
 
 class ActivePosition(BaseModel):
     symbol: str
@@ -311,6 +319,57 @@ class RedisState:
 
     async def set_automation_enabled(self, value: bool) -> None:
         await self._client.set(K_AUTOMATION_ENABLED, self._from_bool(value))
+
+    # =================================================================
+    # BOT MODE & PROCESS MANAGEMENT
+    # =================================================================
+    async def get_mode(self) -> str:
+        """Get current trading mode (backtest, paper, ghost, live)."""
+        v = await self._client.get(K_BOT_MODE)
+        return v if v is not None else "paper"
+
+    async def set_mode(self, mode: str) -> None:
+        """Set trading mode (backtest, paper, ghost, live)."""
+        valid_modes = ["backtest", "paper", "ghost", "live"]
+        if mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {mode}. Must be one of {valid_modes}")
+        await self._client.set(K_BOT_MODE, mode)
+
+    async def get_bot_process_id(self) -> Optional[int]:
+        """Get PID of running bot process."""
+        v = await self._client.get(K_BOT_PROCESS_ID)
+        try:
+            return int(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    async def set_bot_process_id(self, pid: int) -> None:
+        """Store bot process ID."""
+        await self._client.set(K_BOT_PROCESS_ID, str(pid))
+
+    async def clear_bot_process_id(self) -> None:
+        """Clear process ID when bot stops."""
+        await self._client.delete(K_BOT_PROCESS_ID)
+
+    async def get_bot_status(self) -> str:
+        """Get bot status (running|stopped|error)."""
+        v = await self._client.get(K_BOT_STATUS)
+        return v if v is not None else "stopped"
+
+    async def set_bot_status(self, status: str) -> None:
+        """Set bot status."""
+        valid_statuses = ["running", "stopped", "error"]
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status: {status}. Must be one of {valid_statuses}")
+        await self._client.set(K_BOT_STATUS, status)
+
+    async def get_bot_started_at(self) -> Optional[str]:
+        """Get bot start timestamp."""
+        return await self._client.get(K_BOT_STARTED_AT)
+
+    async def set_bot_started_at(self, timestamp: str) -> None:
+        """Set bot start timestamp."""
+        await self._client.set(K_BOT_STARTED_AT, timestamp)
 
     async def get_active_position(self) -> Optional[ActivePosition]:
         raw = await self._client.get(K_ACTIVE_POSITION)

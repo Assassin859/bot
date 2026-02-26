@@ -218,6 +218,113 @@ class ExchangeClient:
             log_event("ERROR", {"msg": "fetch_balance failed", "error": str(e)})
             raise
 
+    # --- Convenience helpers for Phase 2A ---------------------
+    async def get_account_balance(self) -> float:
+        """Return USDT free balance (float)."""
+        try:
+            bal = await self.fetch_balance()
+            usdt = 0.0
+            if isinstance(bal, dict):
+                if "USDT" in bal:
+                    entry = bal.get("USDT") or {}
+                    usdt = float(entry.get("free") or entry.get("total") or 0.0)
+                else:
+                    # fallback to 'total'/'free' keys
+                    for k in ("USDT", "USD"):
+                        if k in bal:
+                            entry = bal.get(k) or {}
+                            usdt = float(entry.get("free") or entry.get("total") or 0.0)
+            return float(usdt)
+        except Exception as e:
+            log_event("ERROR", {"msg": "get_account_balance failed", "error": str(e)})
+            return 0.0
+
+    async def get_account_leverage(self, symbol: str = "BTC/USDT") -> int:
+        """Return detected leverage for given symbol or default."""
+        try:
+            # prefer explicit leverage from positions
+            positions = await self.fetch_positions(symbols=[symbol])
+            if isinstance(positions, list):
+                for p in positions:
+                    if isinstance(p, dict):
+                        lev = p.get("leverage") or (p.get("info") or {}).get("leverage")
+                        if lev:
+                            return int(lev)
+
+            # fallback: inspect market info
+            await self._exchange.load_markets()
+            m = self._exchange.markets.get(symbol)
+            if m and isinstance(m, dict):
+                info = m.get("info") or {}
+                ml = info.get("maxLeverage") or info.get("max_leverage") or info.get("maxLeverageRate")
+                if ml:
+                    return int(ml)
+
+            # final fallback - config default
+            from config import DEFAULT_LEVERAGE
+            return int(DEFAULT_LEVERAGE)
+        except Exception as e:
+            log_event("ERROR", {"msg": "get_account_leverage failed", "error": str(e)})
+            from config import DEFAULT_LEVERAGE
+            return int(DEFAULT_LEVERAGE)
+
+    async def get_margin_info(self) -> Dict[str, float]:
+        """Return margin metrics: total, used, utilization_pct, available_margin."""
+        try:
+            bal = await self.fetch_balance()
+            total = 0.0
+            used = 0.0
+            available = 0.0
+            if isinstance(bal, dict):
+                info = bal.get("info") or {}
+                total = float(info.get("totalWalletBalance") or info.get("totalBalance") or 0.0)
+                used = float(info.get("totalMarginBalance") or info.get("usedMargin") or 0.0)
+                # available from free USDT
+                if "free" in bal and isinstance(bal.get("free"), dict):
+                    available = float(bal.get("free").get("USDT") or 0.0)
+                else:
+                    available = float(bal.get("USDT", {}).get("free") if isinstance(bal.get("USDT"), dict) else 0.0)
+
+            utilization = (used / total * 100) if total > 0 else 0.0
+            return {
+                "total_margin": float(total),
+                "used_margin": float(used),
+                "utilization_pct": float(utilization),
+                "available_margin": float(available),
+            }
+        except Exception as e:
+            log_event("ERROR", {"msg": "get_margin_info failed", "error": str(e)})
+            return {"total_margin": 0.0, "used_margin": 0.0, "utilization_pct": 0.0, "available_margin": 0.0}
+
+    async def get_position_info(self, symbol: str = "BTC/USDT") -> Optional[Dict[str, Any]]:
+        """Return current open position details for `symbol` or None."""
+        try:
+            positions = await self.fetch_positions(symbols=[symbol])
+            if isinstance(positions, list):
+                for p in positions:
+                    if isinstance(p, dict):
+                        size = p.get("size") or p.get("amount") or p.get("contracts") or 0
+                        entry = p.get("entryPrice") or p.get("entry_price") or (p.get("info") or {}).get("entryPrice")
+                        current = None
+                        # attempt to fetch ticker current price
+                        try:
+                            ticker = await self._exchange.fetch_ticker(symbol)
+                            current = float(ticker.get("last") or ticker.get("close") or 0.0)
+                        except Exception:
+                            current = None
+
+                        return {
+                            "symbol": symbol,
+                            "entry_price": float(entry) if entry else 0.0,
+                            "current_price": float(current) if current else 0.0,
+                            "position_size": float(size),
+                            "unrealized_pnl": float(p.get("unrealizedPnl") or p.get("unrealized_pnl") or 0.0),
+                            "leverage": int(p.get("leverage") or (p.get("info") or {}).get("leverage") or 1),
+                        }
+        except Exception as e:
+            log_event("ERROR", {"msg": "get_position_info failed", "error": str(e)})
+        return None
+
     async def sync_account_to_redis(self, redis_state, symbol: str = "BTC/USDT") -> None:
         """Fetch key account info from the exchange and write to Redis.
 
